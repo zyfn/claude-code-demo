@@ -10,8 +10,8 @@ class ReadFileTool(BaseTool):
     description = "Read the contents of a file. Supports text files."
     parameters = {
         "path": {"type": "string", "description": "Path to the file to read"},
-        "offset": {"type": "integer", "description": "Line number to start from (1-indexed)"},
-        "limit": {"type": "integer", "description": "Maximum lines to read"},
+        "offset": {"type": "integer", "description": "Line number to start from (1-indexed)", "optional": True},
+        "limit": {"type": "integer", "description": "Maximum lines to read", "optional": True},
     }
 
     async def execute(self, path: str, offset: int = 1, limit: int | None = None) -> ToolResult:
@@ -77,7 +77,7 @@ class BashTool(BaseTool):
     description = "Execute a shell command. Returns stdout and stderr."
     parameters = {
         "command": {"type": "string", "description": "Shell command to execute"},
-        "cwd": {"type": "string", "description": "Working directory (optional)"},
+        "cwd": {"type": "string", "description": "Working directory", "optional": True},
     }
 
     async def execute(self, command: str, cwd: str | None = None) -> ToolResult:
@@ -106,7 +106,7 @@ class GrepTool(BaseTool):
     parameters = {
         "pattern": {"type": "string", "description": "Search pattern (regex)"},
         "path": {"type": "string", "description": "Directory or file to search in"},
-        "recursive": {"type": "boolean", "description": "Search recursively"},
+        "recursive": {"type": "boolean", "description": "Search recursively", "optional": True},
     }
 
     async def execute(self, pattern: str, path: str = ".", recursive: bool = True) -> ToolResult:
