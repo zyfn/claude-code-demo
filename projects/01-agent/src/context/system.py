@@ -1,24 +1,106 @@
-"""Project context: file tree, git status, relevant files with caching."""
+"""System context — git status, cache breaker.
 
+Mirrors Claude Code's getSystemContext() in context.ts:
+- memoized for the session duration
+- invalidated by cacheBreaker (time-based)
+- provides gitStatus for system prompt injection
+"""
+
+from __future__ import annotations
+
+import subprocess
 import time
 from pathlib import Path
-from typing import Optional
+from typing import TypedDict
 
+
+class SystemContext(TypedDict):
+    git_status: str
+    cache_breaker: str
+
+
+# ─── Module-level memoize ───────────────────────────────────────────────────────
+
+_system_context_cache: SystemContext | None = None
+_cache_time: float = 0
+_CACHE_TTL = 60  # seconds
+
+
+def get_system_context(cwd: str) -> SystemContext:
+    """Return system context (git status + cache breaker).
+
+    Memoized for _CACHE_TTL seconds. Called once per session for
+    system prompt injection; cacheBreaker changes each call to
+    bust any stale in-memory caches downstream.
+
+    Args:
+        cwd: Working directory for git operations
+
+    Returns:
+        { git_status: str, cache_breaker: str }
+    """
+    global _system_context_cache, _cache_time
+
+    now = time.time()
+    if _system_context_cache is not None and (now - _cache_time) < _CACHE_TTL:
+        # Refresh cacheBreaker but keep git_status
+        return SystemContext(
+            git_status=_system_context_cache["git_status"],
+            cache_breaker=str(now),
+        )
+
+    git_status = _get_git_status(cwd)
+    _system_context_cache = SystemContext(
+        git_status=git_status,
+        cache_breaker=str(now),
+    )
+    _cache_time = now
+    return _system_context_cache
+
+
+def _get_git_status(cwd: str) -> str:
+    """Get current git status summary."""
+    try:
+        branch = subprocess.check_output(
+            ["git", "branch", "--show-current"], cwd=cwd, text=True
+        ).strip() or "(detached)"
+        status = subprocess.check_output(
+            ["git", "status", "--short"], cwd=cwd, text=True
+        ).strip()
+        log = subprocess.check_output(
+            ["git", "log", "-1", "--format=%h %s (%cr)"], cwd=cwd, text=True
+        ).strip()
+        result = f"Branch: {branch}\nLast commit: {log}"
+        if status:
+            lines = status.split("\n")
+            result += f"\nChanges ({len(lines)} files):\n{status[:500]}"
+        return result
+    except Exception:
+        return "(not a git repo or git not available)"
+
+
+def invalidate_system_context() -> None:
+    """Invalidate the system context cache. Call when git state changes."""
+    global _system_context_cache, _cache_time
+    _system_context_cache = None
+    _cache_time = 0
+
+
+# ─── ProjectContext (existing, preserved) ──────────────────────────────────────
 
 class ProjectContext:
-    """Project context with file tree caching and lazy loading."""
+    """Project context with file tree and git status caching (display use only)."""
 
-    CACHE_TTL = 60  # Cache validity in seconds
+    CACHE_TTL = 60
 
     def __init__(self, root: str = "."):
         self.root = Path(root).resolve()
-        self._file_tree_cache: Optional[str] = None
+        self._file_tree_cache: str | None = None
         self._file_tree_mtime: float = 0
-        self._git_status_cache: Optional[str] = None
+        self._git_status_cache: str | None = None
         self._git_status_mtime: float = 0
 
     def _get_dir_mtime(self) -> float:
-        """Get the latest modification time of files in root."""
         try:
             mtime = self.root.stat().st_mtime
             for entry in self.root.rglob("*"):
@@ -31,7 +113,6 @@ class ProjectContext:
             return 0
 
     def _get_git_mtime(self) -> float:
-        """Get git HEAD modification time."""
         git_head = self.root / ".git" / "HEAD"
         try:
             return git_head.stat().st_mtime if git_head.exists() else 0
@@ -39,19 +120,15 @@ class ProjectContext:
             return 0
 
     def _is_cache_valid(self, cached_mtime: float, current_mtime: float) -> bool:
-        """Check if cache is still valid based on TTL and file changes."""
         if cached_mtime == 0:
             return False
         age = time.time() - cached_mtime
         return age < self.CACHE_TTL and cached_mtime >= current_mtime
 
     def get_file_tree(self, max_depth: int = 3) -> str:
-        """Generate a file tree string for the project (cached)."""
         current_mtime = self._get_dir_mtime()
-        
         if self._is_cache_valid(self._file_tree_mtime, current_mtime):
             return self._file_tree_cache or ""
-
         lines = [f"📁 {self.root.name}/"]
         self._walk(self.root, lines, "", max_depth, 0)
         self._file_tree_cache = "\n".join(lines)
@@ -67,7 +144,6 @@ class ProjectContext:
             return
         dirs = [e for e in entries if e.is_dir() and not e.name.startswith(".")]
         files = [e for e in entries if e.is_file() and not e.name.startswith(".")]
-        # Skip common noise
         skip_dirs = {"__pycache__", "node_modules", ".git", ".venv", "venv", "dist", "build"}
         dirs = [d for d in dirs if d.name not in skip_dirs]
         all_items = dirs + files
@@ -82,35 +158,15 @@ class ProjectContext:
                 lines.append(f"{prefix}{connector}{item.name}")
 
     def get_git_status(self) -> str:
-        """Get current git status summary (cached)."""
         current_mtime = self._get_git_mtime()
-        
         if self._is_cache_valid(self._git_status_mtime, current_mtime):
             return self._git_status_cache or ""
-
-        import subprocess
-        try:
-            branch = subprocess.check_output(
-                ["git", "branch", "--show-current"], cwd=self.root, text=True
-            ).strip() or "(detached)"
-            status = subprocess.check_output(
-                ["git", "status", "--short"], cwd=self.root, text=True
-            ).strip()
-            log = subprocess.check_output(
-                ["git", "log", "-1", "--format=%h %s (%cr)"], cwd=self.root, text=True
-            ).strip()
-            result = f"Branch: {branch}\nLast commit: {log}"
-            if status:
-                lines = status.split("\n")
-                result += f"\nChanges ({len(lines)} files):\n{status[:500]}"
-            self._git_status_cache = result
-            self._git_status_mtime = time.time()
-            return result
-        except Exception:
-            return "(not a git repo or git not available)"
+        result = _get_git_status(str(self.root))
+        self._git_status_cache = result
+        self._git_status_mtime = time.time()
+        return result
 
     def get_context_summary(self) -> str:
-        """Get full context summary (uses cached values)."""
         return f"""## Project Context
 **Root:** `{self.root}`
 
@@ -125,7 +181,6 @@ class ProjectContext:
 ```"""
 
     def invalidate_cache(self) -> None:
-        """Manually invalidate all caches."""
         self._file_tree_cache = None
         self._file_tree_mtime = 0
         self._git_status_cache = None

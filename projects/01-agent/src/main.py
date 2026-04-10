@@ -51,7 +51,7 @@ def create_agent() -> Agent:
         config=AgentConfig(
             name="main",
             system_prompt=system_prompt,
-            max_tokens=settings.max_tokens,
+            max_output_tokens=settings.max_tokens,
         ),
         client=client,
         tools=tools,

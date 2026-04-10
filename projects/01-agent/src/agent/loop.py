@@ -1,8 +1,10 @@
-"""High-level Agent API and loop exports.
+"""High-level Agent API — wires the query loop with tools and context.
 
-This module re-exports the public API:
-- agent_loop() from core.py
-- Agent class (simplified, no EventBus)
+Uses the new query/core.py agent_loop with QueryParams.
+
+This module re-exports:
+- Agent class
+- AgentConfig
 - StreamEvent types from types.py
 """
 
@@ -13,22 +15,28 @@ from typing import TYPE_CHECKING, AsyncGenerator
 
 from litellm.types.utils import Message
 
-from src.agent.core import agent_loop as _agent_loop, LoopConfig
-from src.agent.deps import AgentDeps
-from src.agent.types import StreamEvent, TextEvent, ToolStartEvent, ToolResultEvent, FinalEvent
+from src.agent.types import (
+    StreamEvent,
+    TextEvent,
+    ToolStartEvent,
+    ToolResultEvent,
+    FinalEvent,
+    TurnStart,
+    ErrorEvent,
+)
 from src.agent.retry import RetryConfig
 from src.tools.executor import ToolExecutor
 from src.llm.client import get_model_info
+from src.query import agent_loop as _query_loop
+from src.query import QueryParams, QueryDeps, Terminal
+from src.query.state import LoopState
 
 if TYPE_CHECKING:
     from src.llm.client import LLMClientProtocol
     from src.tools.base import BaseTool
 
 
-# ─── Public re-exports ─────────────────────────────────────────────────────────
-
-agent_loop = _agent_loop
-__all__ = ["Agent", "AgentConfig", "agent_loop", "StreamEvent"]
+__all__ = ["Agent", "AgentConfig"]
 
 
 # ─── Agent Config ──────────────────────────────────────────────────────────────
@@ -38,26 +46,23 @@ class AgentConfig:
     """Configuration for the high-level Agent API."""
     name: str = "agent"
     system_prompt: str = ""
-    max_iterations: int = 20
-    max_tokens: int = 8192
+    system_context: dict[str, str] | None = None
+    user_context: dict[str, str] | None = None
+    max_turns: int = 20
+    max_output_tokens: int = 8192
     context_ratio: float = 0.8
 
 
 # ─── High-level Agent ──────────────────────────────────────────────────────────
 
 class Agent:
-    """High-level Agent API — wires loop + executor + context manager.
+    """High-level Agent API — wires query loop + executor + context.
 
-    Simplest usage:
+    Usage:
         agent = Agent(config, client, tools)
         async for event in agent.run_stream(user_input):
             if isinstance(event, TextEvent):
                 print(event.text, end="", flush=True)
-
-    For direct loop access (no buffering):
-        deps = agent.make_deps()
-        async for event in agent_loop(config, deps, agent._messages):
-            ...
     """
 
     def __init__(
@@ -69,18 +74,13 @@ class Agent:
         self._config = config
         self._client = client
         self._executor = ToolExecutor(tools)
-        self._messages: list[Message] = [Message(role="system", content=config.system_prompt)]
+        # NOTE: system prompt is NOT stored in _messages.
+        # query/core.py's _prepend_context() adds it fresh at each turn.
+        self._messages: list[Message] = []
 
         primary_model = getattr(client, "_model", "")
         ctx_limit = get_model_info(primary_model).get("max_input_tokens", 128_000)
-
-        from src.context.messages import ContextManager
-        self._ctx = ContextManager(
-            messages=self._messages,
-            count_tokens=client.count_tokens,
-            resolve_limit=lambda: ctx_limit,
-            ratio=config.context_ratio,
-        )
+        self._ctx_limit = ctx_limit
 
     # ── Tool management ────────────────────────────────────────────────────
 
@@ -100,28 +100,6 @@ class Agent:
     @property
     def message_count(self) -> int:
         return len(self._messages)
-
-    # ── Deps factory ───────────────────────────────────────────────────────
-
-    def make_deps(
-        self,
-        retry_config: RetryConfig | None = None,
-    ) -> AgentDeps:
-        """Build AgentDeps from current state.
-
-        Call this after adding/removing tools if you need fresh schemas.
-        """
-        return AgentDeps(
-            call_model=self._client.chat,
-            count_tokens=self._client.count_tokens,
-            get_tool_schemas=lambda: self._executor.to_schemas(),
-            get_tools=lambda: {t.name: t for t in self._executor.tools},
-            execute_tool=self._executor.execute,
-            apply_context_compactions=lambda tools, llm_client: self._ctx.apply_compactions(tools, llm_client),
-            retry_config=retry_config,
-            llm_client=self._client,
-            agent_name=self._config.name,
-        )
 
     # ── Message injection ──────────────────────────────────────────────────
 
@@ -148,16 +126,65 @@ class Agent:
         if user_input:
             self._messages.append(Message(role="user", content=user_input))
 
-        loop_config = LoopConfig(
-            name=self._config.name,
-            max_iterations=self._config.max_iterations,
-            max_tokens=self._config.max_tokens,
+        params = QueryParams(
+            messages=self._messages,
+            system_prompt=self._config.system_prompt,
+            system_context=self._config.system_context or {},
+            user_context=self._config.user_context or {},
+            max_turns=self._config.max_turns,
+            max_output_tokens=self._config.max_output_tokens,
+            deps=self._build_deps(retry_config),
         )
 
-        deps = self.make_deps(retry_config=retry_config)
-
-        async for event in _agent_loop(loop_config, deps, self._messages):
+        async for event in _query_loop(params):
+            # Terminal events are yielded last — handle but don't forward to TUI
+            if isinstance(event, Terminal):
+                # Map Terminal to FinalEvent for backward compatibility
+                yield FinalEvent(text="", reason=event.reason)
+                return
             yield event
+
+    # ── Deps factory ───────────────────────────────────────────────────────
+
+    def _build_deps(self, retry_config: RetryConfig | None) -> QueryDeps:
+        """Build QueryDeps from current state."""
+        from src.context.micro import micro_compact
+        from src.context.compact import auto_compact
+
+        async def async_autocompact(
+            messages: list[Message],
+            llm_client,
+        ) -> dict | None:
+            result = await auto_compact(
+                messages=messages,
+                count_tokens=self._client.count_tokens,
+                llm_client=llm_client,
+                resolve_limit=lambda: self._ctx_limit,
+                tracking=None,
+                ratio=self._config.context_ratio,
+            )
+            return {
+                "summary": result.summary if result else "",
+                "post_compact_messages": result.post_compact_messages if result else messages,
+                "tracking": result.tracking if result else None,
+                "deleted_count": result.deleted_count if result else 0,
+                "pre_compact_token_count": result.pre_compact_token_count if result else 0,
+                "post_compact_token_count": result.post_compact_token_count if result else 0,
+            } if result else None
+
+        return QueryDeps(
+            call_model=self._client.chat,
+            count_tokens=self._client.count_tokens,
+            get_tool_schemas=lambda: self._executor.to_schemas(),
+            get_tools=lambda: {t.name: t for t in self._executor.tools},
+            execute_tool=self._executor.execute,
+            microcompact=micro_compact,
+            autocompact=async_autocompact,
+            llm_client=self._client,
+            resolve_limit=lambda: self._ctx_limit,
+            retry_config=retry_config,
+            agent_name=self._config.name,
+        )
 
     # ── Convenience run ───────────────────────────────────────────────────
 
