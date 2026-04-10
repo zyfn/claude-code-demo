@@ -1,14 +1,13 @@
 """Tool definitions and registry."""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import ClassVar
+from dataclasses import dataclass
+from typing import ClassVar, TYPE_CHECKING
 
-
-@dataclass
-class ToolResult:
-    output: str
-    is_error: bool = False
+if TYPE_CHECKING:
+    from src.tools.executor import ToolResult
 
 
 # Global tool registry — populated automatically when tool classes are imported.
@@ -21,6 +20,12 @@ def get_all_tools() -> list["BaseTool"]:
 
 
 class BaseTool(ABC):
+    """Base class for all tools.
+
+    Provides conservative defaults for concurrency.
+    Subclasses should override only what they need.
+    """
+
     name: ClassVar[str] = ""
     description: ClassVar[str] = ""
     # Each key maps to an OpenAI-compatible parameter schema dict.
@@ -34,7 +39,7 @@ class BaseTool(ABC):
             _tool_registry[cls.name] = cls
 
     @abstractmethod
-    async def execute(self, **kwargs) -> ToolResult:
+    async def execute(self, **kwargs) -> "ToolResult":
         ...
 
     def to_schema(self) -> dict:
@@ -60,3 +65,11 @@ class BaseTool(ABC):
                 },
             },
         }
+
+    def is_enabled(self) -> bool:
+        """Whether this tool is currently available. Override to implement feature flags."""
+        return True
+
+    def is_concurrency_safe(self, **kwargs) -> bool:
+        """Whether this tool can safely run in parallel with other tools. Default False (conservative)."""
+        return False
