@@ -63,7 +63,7 @@ class AgentDeps:
     # ── Context ─────────────────────────────────────────────────────────────
 
     apply_context_compactions: Callable[
-        [list[dict], Any], dict
+        [list[dict], Any], Awaitable[dict]
     ]
     """Apply context compaction and return stats dict."""
 

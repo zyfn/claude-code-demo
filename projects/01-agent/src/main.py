@@ -1,12 +1,17 @@
 """Main entry point — wires together all components.
 
 Architecture: agent_loop yields StreamEvents directly to TUI (no EventBus).
+Responsibilities are intentionally narrow:
+- TUI event loop (run_tui_events, main_loop)
+- Slash command dispatch (/skill)
+- HTTP error surfacing
+All other concerns (prompt building, tool execution, context compression)
+live in their own modules.
 """
 
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 import httpx
 
 from litellm.types.utils import Message
@@ -19,76 +24,13 @@ from src.agent.retry import RetryConfig
 from src.tools import get_all_tools
 from src.ui.tui import TUI
 from src.context.system import ProjectContext
+from src.context.prompt import build_system_prompt, load_claude_md
 from src.skills import format_skills_for_system_prompt, get_skill_loader
 
 
 # Initialize skill loader (loads bundled + user skills from .md files)
 skill_loader = get_skill_loader()
-skill_loader.reset_active()  # Clear any stale active skills from prior sessions
-
-
-# ─── System prompt builder ──────────────────────────────────────────────────────
-
-TOOL_DESCRIPTIONS = {
-    "Read": "Read the contents of a file.",
-    "Write": "Create or overwrite a file with content.",
-    "Edit": "Make precise edits to a file by replacing exact text.",
-    "Bash": "Execute a shell command.",
-    "Grep": "Search for patterns in files using grep.",
-    "Glob": "Find files matching a glob pattern.",
-    "delegate": "Delegate a sub-task to a specialized agent.",
-    "load_skill": "Load the full content of a skill by name.",
-}
-
-
-SYSTEM_PROMPT_TEMPLATE = """You are an expert AI coding assistant.
-
-## Available Tools
-{tools}
-
-## Available Skills
-{skills}
-
-## Guidelines
-1. Explore the codebase before making changes — use Read, Grep, Glob to understand the structure
-2. Make incremental changes, verify each step
-3. Run tests to confirm correctness
-4. Keep changes focused and minimal
-5. If a task requires a specific skill, use the /skill command or load_skill tool
-"""
-
-
-def build_system_prompt() -> str:
-    """Build the system prompt with role, tools, and skills."""
-    tools = get_all_tools()
-    tool_lines = []
-    for t in tools:
-        if t.is_enabled():
-            desc = TOOL_DESCRIPTIONS.get(t.name, t.description)
-            tool_lines.append(f"- {t.name}: {desc}")
-    tools_str = "\n".join(tool_lines) if tool_lines else "(no tools available)"
-
-    skills_str = format_skills_for_system_prompt()
-
-    return SYSTEM_PROMPT_TEMPLATE.format(
-        tools=tools_str,
-        skills=skills_str if skills_str else "(no skills available)",
-    )
-
-
-def load_claude_md(root: str) -> str | None:
-    """Load CLAUDE.md from project root or any parent directory (like Claude Code).
-
-    Searches up the directory tree, starting from root, returning the first
-    CLAUDE.md found. This matches Claude Code's behavior where CLAUDE.md files
-    in parent directories also apply.
-    """
-    path = Path(root).resolve()
-    for parent in [path] + list(path.parents):
-        md_path = parent / "CLAUDE.md"
-        if md_path.is_file():
-            return md_path.read_text(encoding="utf-8")
-    return None
+skill_loader.reset_active()
 
 
 def create_agent() -> Agent:
@@ -102,7 +44,8 @@ def create_agent() -> Agent:
     )
 
     tools = get_all_tools()
-    system_prompt = build_system_prompt()
+    skills_str = format_skills_for_system_prompt()
+    system_prompt = build_system_prompt(tools, skills_str)
 
     agent = Agent(
         config=AgentConfig(
@@ -171,12 +114,8 @@ async def main_loop():
                 loader = get_skill_loader()
                 skill = loader.get(skill_name)
                 if skill:
-                    # Mark active BEFORE injecting so subsequent load_skill calls
-                    # (if model calls them) return lightweight notice instead of
-                    # duplicating the content.
                     loader.mark_active(skill_name)
 
-                    # Build skill content message — same substitution as load_skill
                     content = skill.content
                     content = content.replace("${CLAUDE_SKILL_DIR}", skill.root_dir)
                     content = content.replace("${ARGUMENTS}", skill_args)

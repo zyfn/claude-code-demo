@@ -5,11 +5,11 @@ This module contains only the loop logic. All external dependencies
 
 Architecture (following Claude Code's query loop):
     while True:
-        1. context = prepare_context(messages)
+        1. context = prepare_context(state.messages)
         2. response = yield* call_model_with_retry(context)
         3. if no tool_use: yield final; break
         4. results = yield* execute_tools_streaming(tool_uses)
-        5. messages.append(response, results)
+        5. state = next_state(state, results)
 
 No EventBus — events are yielded directly to the caller.
 """
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, AsyncGenerator
 
 from litellm.types.utils import Message
@@ -53,6 +53,40 @@ class LoopConfig:
     max_tokens: int = 8192
 
 
+# ─── Loop State ────────────────────────────────────────────────────────────────
+
+@dataclass
+class LoopState:
+    """Immutable-style state carried through the ReAct loop.
+
+    Following Claude Code's pattern: state is replaced wholesale on each
+    iteration rather than mutated in place. This makes state transitions
+    explicit and traceable.
+    """
+    messages: list[Message]
+    turn_count: int = 0
+    auto_compact_count: int = 0  # Tracks auto-compaction invocations
+    max_output_tokens_count: int = 0  # Tracks max-output recovery attempts
+
+    def with_messages(self, messages: list[Message]) -> "LoopState":
+        """Return a new state with updated messages."""
+        return LoopState(
+            messages=messages,
+            turn_count=self.turn_count,
+            auto_compact_count=self.auto_compact_count,
+            max_output_tokens_count=self.max_output_tokens_count,
+        )
+
+    def with_turn(self, turn_count: int) -> "LoopState":
+        """Return a new state with incremented turn count."""
+        return LoopState(
+            messages=self.messages,
+            turn_count=turn_count,
+            auto_compact_count=self.auto_compact_count,
+            max_output_tokens_count=self.max_output_tokens_count,
+        )
+
+
 # ─── AsyncGenerator Loop ───────────────────────────────────────────────────────
 
 async def agent_loop(
@@ -77,15 +111,15 @@ async def agent_loop(
     Args:
         config: Loop configuration (name, max_iterations, etc.)
         deps: All external dependencies
-        messages: Conversation history (modified in-place)
+        messages: Conversation history (used to initialise LoopState)
     """
-    state = RetryState()
+    retry_state = RetryState()
     retry_config = deps.retry_config or RetryConfig()
-    turn_count = 0
+    loop_state = LoopState(messages=messages)
 
-    while turn_count < config.max_iterations:
-        turn_count += 1
-        yield TurnStart(turn=turn_count)
+    while loop_state.turn_count < config.max_iterations:
+        loop_state = loop_state.with_turn(loop_state.turn_count + 1)
+        yield TurnStart(turn=loop_state.turn_count)
 
         # ── LLM streaming ──────────────────────────────────────────────────
 
@@ -94,17 +128,16 @@ async def agent_loop(
         try:
             async for chunk in with_retry(
                 deps.call_model,
-                messages,
+                loop_state.messages,
                 deps.get_tool_schemas(),
                 retry_config,
-                state,
+                retry_state,
                 config.max_tokens,
             ):
                 event = handle_chunk(chunk, acc)
                 if event is None:
                     continue
 
-                # Update accumulator for final assembly
                 if isinstance(event, TextEvent):
                     if event.type == "content":
                         acc.text += event.text
@@ -132,17 +165,26 @@ async def agent_loop(
 
         # ── Execute tools ──────────────────────────────────────────────────
 
-        tool_events = await _execute_tools(
+        loop_state, tool_events = await _execute_tools(
             acc.tool_calls,
             deps,
-            messages,
+            loop_state,
         )
         for ev in tool_events:
             yield ev
 
         # ── Context compaction at turn end ─────────────────────────────────
 
-        deps.apply_context_compactions(deps.get_tool_schemas(), deps.llm_client)
+        compaction_stats = await deps.apply_context_compactions(
+            deps.get_tool_schemas(), deps.llm_client
+        )
+        if compaction_stats.get("auto_compact"):
+            loop_state = LoopState(
+                messages=loop_state.messages,
+                turn_count=loop_state.turn_count,
+                auto_compact_count=loop_state.auto_compact_count + 1,
+                max_output_tokens_count=loop_state.max_output_tokens_count,
+            )
 
     # Max iterations reached
     yield FinalEvent(text=acc.text, reason="max_turns")
@@ -153,15 +195,15 @@ async def agent_loop(
 async def _execute_tools(
     tool_calls: list[dict],
     deps: AgentDeps,
-    messages: list[Message],
-) -> list[StreamEvent]:
-    """Execute all tool calls and return events.
+    state: LoopState,
+) -> tuple[LoopState, list[StreamEvent]]:
+    """Execute all tool calls and return updated state + events.
 
-    Runs tools in batches based on concurrency safety (from orchestration.py).
+    Runs tools in batches based on concurrency safety.
+    Returns (new_state, events).
     """
     from src.tools.orchestration import partition_tool_calls, ToolCall
 
-    # Get tool instances for partition
     tools = deps.get_tools()
 
     # Pre-parse arguments once to avoid duplicate json.loads
@@ -170,32 +212,24 @@ async def _execute_tools(
         for tc in tool_calls
     ]
 
-    # Convert to ToolCall format
     calls = [
         ToolCall(name=tc["name"], params=params, tool_call_id=tc["id"])
         for tc, params in parsed
     ]
 
-    # Partition into batches
     batches = partition_tool_calls(calls, tools)
 
     results: list[ToolResult] = []
     for batch in batches:
-        # Execute batch
         batch_results = await _execute_batch(batch, deps)
         results.extend(batch_results)
 
-    # Generate events
+    # Build events and collect new messages from tools
     events: list[StreamEvent] = []
     new_messages: list[Message] = []
 
     for (tc, params), result in zip(parsed, results):
-        # Emit ToolStartEvent before ToolResultEvent
-        events.append(ToolStartEvent(
-            type="tool_start",
-            name=tc["name"],
-            params=params,
-        ))
+        events.append(ToolStartEvent(type="tool_start", name=tc["name"], params=params))
         if isinstance(result, Exception):
             result = ToolResult(f"Error: {result}", is_error=True)
         events.append(ToolResultEvent(
@@ -204,18 +238,17 @@ async def _execute_tools(
             output=result.output,
             is_error=result.is_error,
         ))
-        # Collect new messages from tool results (generic, tool-agnostic)
         if result.new_messages:
             new_messages.extend(result.new_messages)
 
-    # Append tool results to messages
-    _append_tool_results(messages, tool_calls, results)
-
-    # Inject new messages from skills
+    # Build next state (messages replaced, other fields preserved)
+    next_messages = list(state.messages)
+    for tc, result in zip(tool_calls, results):
+        next_messages.append(Message(role="tool", content=result.output, tool_call_id=tc["id"]))
     for msg in new_messages:
-        messages.append(msg)
+        next_messages.append(msg)
 
-    return events
+    return state.with_messages(next_messages), events
 
 
 async def _execute_batch(batch, deps: AgentDeps) -> list[ToolResult]:
@@ -227,8 +260,6 @@ async def _execute_batch(batch, deps: AgentDeps) -> list[ToolResult]:
 
     results: list[ToolResult] = []
     if batch.concurrent:
-        # Concurrent batch — run all at once (up to MAX_CONCURRENT)
-        import asyncio
         chunk_size = 10
         for i in range(0, len(batch.calls), chunk_size):
             chunk = batch.calls[i:i + chunk_size]
@@ -242,26 +273,8 @@ async def _execute_batch(batch, deps: AgentDeps) -> list[ToolResult]:
                 else:
                     results.append(r)
     else:
-        # Serial batch
         for call in batch.calls:
             result = await exec_fn(call.name, call.params, call.tool_call_id)
             results.append(result)
 
     return results
-
-
-def _append_tool_results(
-    messages: list[Message],
-    tool_calls: list[dict],
-    results: list[ToolResult],
-) -> None:
-    """Append tool result messages to the conversation history.
-
-    Each tool result is a separate Message with role='tool'.
-    """
-    for tc, result in zip(tool_calls, results):
-        messages.append(Message(
-            role="tool",
-            content=result.output,
-            tool_call_id=tc["id"],
-        ))

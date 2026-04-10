@@ -188,7 +188,7 @@ class ContextManager:
             current = self.count(tools)
         return removed
 
-    def apply_compactions(
+    async def apply_compactions(
         self,
         tools: list[dict] | None = None,
         llm_client: "LLMClientProtocol | None" = None,
@@ -204,16 +204,8 @@ class ContextManager:
 
         # Level 3: auto compact (async, only if needed)
         if llm_client:
-            import asyncio
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # Can't await in non-async context easily — skip for now
-                    pass
-                else:
-                    stats["auto_compact"] = asyncio.run(
-                        self.auto_compact(tools, llm_client)
-                    )
+                stats["auto_compact"] = await self.auto_compact(tools, llm_client)
             except Exception:
                 pass
 
