@@ -16,7 +16,10 @@ receives the output of the previous.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Awaitable
+from typing import Callable, Awaitable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.llm.client import LLMClientProtocol
 
 from litellm.types.utils import Message
 
@@ -27,7 +30,6 @@ from .compact import (
     should_auto_compact,
     AutoCompactResult,
     AutoCompactTracking,
-    AUTO_COMPACT_BUFFER,
 )
 
 
@@ -53,9 +55,10 @@ class ContextPipeline:
         resolve_limit: Callable[[], int],
         microcompact_fn: Callable[[list[Message]], tuple[list[Message], int]] | None = None,
         autocompact_fn: Callable[
-            [list[Message], object], Awaitable[AutoCompactResult | None]
+            [list[Message], "LLMClientProtocol | None"],
+            Awaitable[AutoCompactResult | None],
         ] | None = None,
-        llm_client: object = None,
+        llm_client: "LLMClientProtocol | None" = None,
         ratio: float = 0.8,
         persist_dir: str | None = None,
     ):

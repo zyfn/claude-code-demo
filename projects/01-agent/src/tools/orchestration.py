@@ -1,53 +1,109 @@
-"""Tool orchestration — partition tool calls by concurrency safety.
+"""Tool orchestration — StreamingToolExecutor.
 
-partition_tool_calls() groups tools into batches:
-- isConcurrencySafe tools → concurrent batch (up to MAX_CONCURRENT)
-- Non-safe tools → serial batch (one at a time)
+StreamingToolExecutor executes tools as their tool_use blocks arrive
+in the LLM stream, without waiting for the stream to complete.
 """
 
+from __future__ import annotations
+
+import asyncio
 from dataclasses import dataclass
 
 from src.tools.base import BaseTool
+from src.tools.executor import ToolResult
 
 
 MAX_CONCURRENT = 10
 
 
+# ─── Streaming Tool Executor ───────────────────────────────────────────────────
+
 @dataclass
-class ToolCall:
-    """A single tool call to execute."""
+class ToolUse:
+    """A complete tool use (all arguments received)."""
     name: str
     params: dict
     tool_call_id: str
 
 
-@dataclass
-class Batch:
-    """A batch of tool calls — either concurrent or serial."""
-    concurrent: bool
-    calls: list[ToolCall]
+class StreamingToolExecutor:
+    """Executes tools as they arrive in the LLM stream.
 
+    While the LLM streams tool_use blocks, this executor:
+    1. Collects tool_use blocks as they complete (arguments fully received)
+    2. Submits them for execution immediately
+    3. Yields ToolResultEvents as each tool completes
+    4. Allows the LLM stream to continue uninterrupted
 
-def partition_tool_calls(calls: list[ToolCall], tools: dict[str, BaseTool]) -> list[Batch]:
-    """Partition tool calls into batches based on concurrency safety.
-
-    Safe tools are grouped into concurrent batches (max MAX_CONCURRENT per batch).
-    Unsafe tools each get their own serial batch.
+    This is the key architectural difference from batch execution:
+    tools run in parallel with the LLM stream rather than waiting for it to end.
     """
-    batches: list[Batch] = []
 
-    for call in calls:
-        tool = tools.get(call.name)
-        is_safe = False
+    def __init__(
+        self,
+        tools: dict[str, BaseTool],
+        execute_tool_fn: callable,
+        max_concurrent: int = MAX_CONCURRENT,
+    ):
+        self._tools = tools
+        self._execute_fn = execute_tool_fn
+        self._max_concurrent = max_concurrent
+
+        # Pending tool uses waiting to be assigned a worker
+        self._pending: list[ToolUse] = []
+        # Currently running tasks: tool_call_id → asyncio.Task
+        self._running: dict[str, asyncio.Task] = {}
+        # Completed results not yet yielded
+        self._completed: list[tuple[ToolUse, ToolResult]] = []
+
+        self._executor_lock = asyncio.Lock()
+
+    def add_tool_use(self, tool_use: ToolUse) -> None:
+        """Add a complete tool use to the pending queue and try to execute it."""
+        self._pending.append(tool_use)
+        asyncio.create_task(self._try_dispatch())
+
+    async def _try_dispatch(self) -> None:
+        """Try to dispatch pending tools up to max_concurrent."""
+        async with self._executor_lock:
+            while self._pending and len(self._running) < self._max_concurrent:
+                tu = self._pending.pop(0)
+                self._running[tu.tool_call_id] = asyncio.create_task(
+                    self._execute(tu)
+                )
+
+    async def _execute(self, tool_use: ToolUse) -> None:
+        """Execute a single tool and store its result."""
         try:
-            is_safe = tool.is_concurrency_safe(**call.params) if tool else False
-        except Exception:
-            is_safe = False  # Conservative
+            result = await self._execute_fn(
+                tool_use.name,
+                tool_use.params,
+                tool_use.tool_call_id,
+            )
+        except Exception as e:
+            result = ToolResult(f"Error: {e}", is_error=True)
 
-        last = batches[-1] if batches else None
-        if is_safe and last and last.concurrent:
-            last.calls.append(call)
-        else:
-            batches.append(Batch(concurrent=is_safe, calls=[call]))
+        async with self._executor_lock:
+            if tool_use.tool_call_id in self._running:
+                del self._running[tool_use.tool_call_id]
+            self._completed.append((tool_use, result))
 
-    return batches
+    async def drain(self) -> list[tuple[ToolUse, ToolResult]]:
+        """Wait for all running tools to complete and return results.
+
+        Also re-dispatches any pending tools that couldn't be dispatched earlier
+        (because _running was full when they were added).
+        """
+        if self._running:
+            await asyncio.gather(*self._running.values(), return_exceptions=True)
+        # Re-dispatch any pending items that were stranded when _running was full
+        await self._try_dispatch()
+        if self._running:
+            await asyncio.gather(*self._running.values(), return_exceptions=True)
+        return self._completed
+
+    def drain_completed(self) -> list[tuple[ToolUse, ToolResult]]:
+        """Return and clear completed results without waiting."""
+        completed = list(self._completed)
+        self._completed.clear()
+        return completed

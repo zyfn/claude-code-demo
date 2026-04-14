@@ -37,8 +37,8 @@ class TeammateConfig:
     tools: list[Any]  # List of BaseTool
     system_prompt: str = ""
     model: str = "claude-sonnet-4-6"
-    max_iterations: int = 20
-    max_tokens: int = 8192
+    max_turns: int = 20
+    max_output_tokens: int = 8192
 
 
 @dataclass
@@ -61,8 +61,8 @@ async def run_teammate(
     Uses AsyncLocalStorage so each teammate has its own context.
     Communicates with coordinator via mailbox.
     """
-    from src.agent.loop import Agent, AgentConfig
-    from src.agent.types import FinalEvent
+    from src.agent import Agent, AgentConfig
+    from src.agent.query.types import FinalEvent
 
     mailbox = TeammateMailbox(config.id, config.team)
     ctx = TeammateContext(
@@ -79,8 +79,8 @@ async def run_teammate(
         agent_config = AgentConfig(
             name=config.id,
             system_prompt=config.system_prompt,
-            max_iterations=config.max_iterations,
-            max_tokens=config.max_tokens,
+            max_turns=config.max_turns,
+            max_output_tokens=config.max_output_tokens,
         )
 
         agent = Agent(config=agent_config, client=client, tools=config.tools)
@@ -92,10 +92,10 @@ async def run_teammate(
 
         # Notify main mailbox of completion
         if main_mailbox:
-            result_text = final_event.text if final_event else "No result"
+            result_reason = final_event.reason if final_event else "no_response"
             main_mailbox.send(MailboxMessage(
                 source=config.id,
-                content=f"Task completed: {result_text}",
+                content=f"Task completed: {result_reason}",
                 metadata={"status": "done"},
             ))
     finally:

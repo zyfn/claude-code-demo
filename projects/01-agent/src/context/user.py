@@ -69,8 +69,3 @@ def load_claude_md(cwd: str) -> str | None:
     return None
 
 
-def invalidate_user_context() -> None:
-    """Invalidate the user context cache. Call when CLAUDE.md changes."""
-    global _user_context_cache, _cache_time
-    _user_context_cache = None
-    _cache_time = 0

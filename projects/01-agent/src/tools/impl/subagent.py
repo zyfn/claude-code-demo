@@ -11,7 +11,7 @@ from src.tools.executor import ToolResult
 from litellm.types.utils import Message
 
 if TYPE_CHECKING:
-    from src.agent.loop import Agent
+    from src.agent import Agent
 
 
 class SubAgentTool(BaseTool):
@@ -37,8 +37,8 @@ class SubAgentTool(BaseTool):
 
     async def execute(self, task: str, agent_type: str | None = None, **kwargs) -> ToolResult:
         """Execute a sub-agent to handle the task."""
-        from src.agent.loop import Agent, AgentConfig
-        from src.agent.types import TextEvent
+        from src.agent import Agent, AgentConfig
+        from src.agent.query.types import TextEvent
 
         client = kwargs.get("_sub_agent_client")
         if client is None:
@@ -50,8 +50,8 @@ class SubAgentTool(BaseTool):
         config = AgentConfig(
             name=f"subagent_{agent_type or 'default'}",
             system_prompt=system_prompt,
-            max_iterations=10,
-            max_tokens=max_tokens,
+            max_turns=10,
+            max_output_tokens=max_tokens,
         )
 
         from src.tools import get_all_tools
@@ -76,18 +76,18 @@ async def spawn_sub_agent(
     client,
     tools: list[BaseTool],
     system_prompt: str = "",
-    max_iterations: int = 10,
-    max_tokens: int = 4096,
+    max_turns: int = 10,
+    max_output_tokens: int = 4096,
 ) -> str:
     """Spawn a sub-agent and return its final response."""
-    from src.agent.loop import Agent, AgentConfig
-    from src.agent.types import TextEvent
+    from src.agent import Agent, AgentConfig
+    from src.agent.query.types import TextEvent
 
     config = AgentConfig(
         name=f"subagent_{agent_type or 'default'}",
         system_prompt=system_prompt,
-        max_iterations=max_iterations,
-        max_tokens=max_tokens,
+        max_turns=max_turns,
+        max_output_tokens=max_output_tokens,
     )
 
     agent = Agent(config=config, client=client, tools=tools)

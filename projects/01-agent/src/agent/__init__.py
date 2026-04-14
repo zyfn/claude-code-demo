@@ -1,14 +1,18 @@
-"""Agent module — public API.
+"""Agent module — high-level public API.
+
+Mirrors Claude Code's agent/ directory:
+- Agent class, AgentConfig: high-level agent API
+- query/ submodule: core ReAct loop (agent/query.ts)
 
 Re-exports:
-- Agent, AgentConfig from loop.py
-- StreamEvent types from types.py
-- RetryConfig, RetryState from retry.py
-- AgentDeps (alias QueryDeps) from query/deps.py
+- Agent, AgentConfig from .agent
+- StreamEvent types from .query.types
+- RetryConfig, RetryState from .query.retry
 """
 
-from src.agent.loop import Agent, AgentConfig
-from src.agent.types import (
+from .agent import Agent, AgentConfig
+from .query.retry import RetryConfig, RetryState
+from .query.types import (
     StreamEvent,
     TurnStart,
     TextEvent,
@@ -18,14 +22,10 @@ from src.agent.types import (
     FinalEvent,
     ErrorEvent,
 )
-from src.agent.retry import RetryConfig, RetryState
-from src.query.deps import AgentDeps
 
 __all__ = [
-    # Core
     "Agent",
     "AgentConfig",
-    # Types
     "StreamEvent",
     "TurnStart",
     "TextEvent",
@@ -34,9 +34,6 @@ __all__ = [
     "StreamEnd",
     "FinalEvent",
     "ErrorEvent",
-    # Retry
     "RetryConfig",
     "RetryState",
-    # Deps
-    "AgentDeps",
 ]
