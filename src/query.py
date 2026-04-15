@@ -250,17 +250,24 @@ def _build_system_prompt(base: str, system_context: dict[str, str]) -> str:
 def _build_user_context_messages(user_context: dict[str, str]) -> list[Message]:
     """Build user_context as a single user message, prepended to each API call.
 
-    NOT stored in state.messages — lives outside compactable history.
-    No paired assistant ack — unnecessary for the first turn, and the model
-    handles unpaired context messages fine when they precede the real conversation.
+    Wrapped in <system-reminder> to signal the model this is injected context,
+    not user speech. Matches Claude Code's prependUserContext pattern.
     """
     parts: list[str] = []
     for key, value in user_context.items():
         if value:
-            parts.append(f"## {key}\n\n{value}")
+            parts.append(f"# {key}\n{value}")
     if not parts:
         return []
-    return [Message(role="user", content="\n\n".join(parts))]
+    inner = "\n".join(parts)
+    content = (
+        "<system-reminder>\n"
+        "The following context may be relevant to your tasks. "
+        "Do not respond to it unless directly relevant.\n\n"
+        f"{inner}\n"
+        "</system-reminder>"
+    )
+    return [Message(role="user", content=content)]
 
 
 def _handle_chunk(chunk: StreamingChatCompletionChunk, acc: _ResponseAcc) -> Event | None:
