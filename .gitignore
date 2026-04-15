@@ -1,0 +1,35 @@
+# Environment
+.env
+
+# Claude Code
+.ccc/
+.kiro/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+*.egg
+
+# Build artifacts
+dist/
+build/
+.venv/
+
+# IDE
+pyrightconfig.json
+.vscode/
+.idea/
+
+# Debug / logs
+debug/
+*.log
+
+# Docs (local)
+docs/TODO.md
+docs/test.md
+
+# Misc
+*.swp
+*.swo
+.DS_Store
